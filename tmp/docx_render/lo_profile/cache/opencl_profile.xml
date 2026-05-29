@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<profile>
+ <version>LibreOffice v1</version>
+ <device>
+  <type>opencl</type>
+  <name>NVIDIA GeForce RTX 4060 Laptop GPU</name>
+  <driver>591.74</driver>
+  <time>24594</time>
+  <errors>false</errors>
+ </device>
+ <device>
+  <type>opencl</type>
+  <name>gfx1103</name>
+  <driver>3584.0 (PAL,LC)</driver>
+  <time>64531</time>
+  <errors>false</errors>
+ </device>
+ <device>
+  <type>native</type>
+  <time>1575936</time>
+  <errors>false</errors>
+ </device>
+</profile>
