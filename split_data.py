@@ -1,155 +1,185 @@
 """
-Data split script for Cube dataset.
-Splits 343 images into train/valid/test at 80/10/10 with seed=42.
-Copies files (does not move originals).
+Split the cleaned Cube YOLOv8 dataset into train/valid/test.
+
+This script assumes labels have already been cleaned to 4 classes:
+0 Cube_food, 1 Cube_ins, 2 Cube_medicine, 3 Cube_tool.
+It copies files into Cube.yolov8/split and recreates that directory on
+each run so stale files from older datasets cannot remain.
 """
+
 import os
-import sys
-import shutil
 import random
+import shutil
+import sys
+from collections import Counter
 from pathlib import Path
 
-# Force UTF-8 output on Windows
-sys.stdout.reconfigure(encoding='utf-8')
 
-random.seed(42)
+sys.stdout.reconfigure(encoding="utf-8")
 
-# Paths
-BASE = Path(r"e:/xwechat_files/wxid_el79rox3ahjk12_09c9/msg/file/2026-05/yolo_gsing")
+SEED = 42
+TRAIN_RATIO = 0.80
+VALID_RATIO = 0.10
+ALLOWED_CLASSES = {0, 1, 2, 3}
+CLASS_NAMES = ["Cube_food", "Cube_ins", "Cube_medicine", "Cube_tool"]
+
+BASE = Path(__file__).resolve().parent
 CUBE = BASE / "Cube.yolov8"
 SRC_IMAGES = CUBE / "train" / "images"
 SRC_LABELS = CUBE / "train" / "labels"
 SPLIT = CUBE / "split"
 
-# Ratios
-TRAIN_RATIO = 0.80
-VALID_RATIO = 0.10
-TEST_RATIO = 0.10
 
-# Gather all image files (strip extensions to get base names)
-image_files = sorted([f for f in os.listdir(SRC_IMAGES) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-random.shuffle(image_files)
+def image_files():
+    return sorted(
+        f
+        for f in os.listdir(SRC_IMAGES)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    )
 
-n = len(image_files)
-n_train = int(n * TRAIN_RATIO)
-n_valid = int(n * VALID_RATIO)
-# n_test gets the remainder to ensure exact total
 
-train_files = image_files[:n_train]
-valid_files = image_files[n_train:n_train + n_valid]
-test_files = image_files[n_train + n_valid:]
+def label_name_for(image_name):
+    return Path(image_name).with_suffix(".txt").name
 
-print(f"Total images: {n}")
-print(f"Train: {len(train_files)}")
-print(f"Valid: {len(valid_files)}")
-print(f"Test:  {len(test_files)}")
-print(f"Sum:   {len(train_files) + len(valid_files) + len(test_files)}")
 
-# Create directories
-for split_name in ["train", "valid", "test"]:
-    for sub in ["images", "labels"]:
-        (SPLIT / split_name / sub).mkdir(parents=True, exist_ok=True)
+def read_class_ids(label_path):
+    class_ids = []
+    with open(label_path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            class_ids.append(int(float(line.split()[0])))
+    return class_ids
 
-# Copy function
-def copy_files(file_list, src_dir, dst_dir):
-    for fname in file_list:
-        shutil.copy2(src_dir / fname, dst_dir / fname)
 
-# Copy images
-print("\nCopying images...")
-copy_files(train_files, SRC_IMAGES, SPLIT / "train" / "images")
-copy_files(valid_files, SRC_IMAGES, SPLIT / "valid" / "images")
-copy_files(test_files, SRC_IMAGES, SPLIT / "test" / "images")
+def copy_pair(image_name, split_name):
+    label_name = label_name_for(image_name)
+    src_image = SRC_IMAGES / image_name
+    src_label = SRC_LABELS / label_name
+    dst_image = SPLIT / split_name / "images" / image_name
+    dst_label = SPLIT / split_name / "labels" / label_name
 
-# Copy corresponding labels
-print("Copying labels...")
-for split_name, file_list in [("train", train_files), ("valid", valid_files), ("test", test_files)]:
-    dst_labels = SPLIT / split_name / "labels"
-    for fname in file_list:
-        # Replace image extension with .txt
-        base = os.path.splitext(fname)[0]
-        label_name = base + ".txt"
-        src_label = SRC_LABELS / label_name
-        if src_label.exists():
-            shutil.copy2(src_label, dst_labels / label_name)
-        else:
-            print(f"  WARNING: No label found for {fname} (expected {label_name})")
+    if not src_label.exists():
+        raise FileNotFoundError(f"Missing label for {image_name}: {label_name}")
 
-# Validate
-print("\n=== Validation ===")
-all_ok = True
-for split_name in ["train", "valid", "test"]:
-    img_dir = SPLIT / split_name / "images"
-    lbl_dir = SPLIT / split_name / "labels"
-    imgs = set(os.path.splitext(f)[0] for f in os.listdir(img_dir))
-    lbls = set(os.path.splitext(f)[0] for f in os.listdir(lbl_dir))
-    missing_labels = imgs - lbls
-    extra_labels = lbls - imgs
-    print(f"{split_name}: {len(imgs)} images, {len(lbls)} labels")
-    if missing_labels:
-        print(f"  MISSING labels for: {missing_labels}")
-        all_ok = False
-    if extra_labels:
-        print(f"  EXTRA labels: {extra_labels}")
-        all_ok = False
+    shutil.copy2(src_image, dst_image)
+    shutil.copy2(src_label, dst_label)
 
-# Check class labels are only 0,1,2,3
-print("\n=== Class Label Check ===")
-for split_name in ["train", "valid", "test"]:
-    lbl_dir = SPLIT / split_name / "labels"
-    bad_classes = set()
-    for fname in os.listdir(lbl_dir):
-        with open(lbl_dir / fname) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    cls = int(float(line.split()[0]))
-                    if cls not in (0, 1, 2, 3):
-                        bad_classes.add(cls)
+
+def validate_pairs(files):
+    missing = []
+    for image_name in files:
+        if not (SRC_LABELS / label_name_for(image_name)).exists():
+            missing.append(image_name)
+    if missing:
+        raise RuntimeError(f"Missing labels for {len(missing)} images: {missing[:5]}")
+
+
+def validate_classes(files):
+    counts = Counter()
+    bad_classes = Counter()
+    for image_name in files:
+        label_path = SRC_LABELS / label_name_for(image_name)
+        for class_id in read_class_ids(label_path):
+            counts[class_id] += 1
+            if class_id not in ALLOWED_CLASSES:
+                bad_classes[class_id] += 1
     if bad_classes:
-        print(f"  {split_name}: BAD CLASSES {bad_classes}")
-        all_ok = False
-    else:
-        print(f"  {split_name}: all classes in [0,1,2,3] ✓")
+        raise RuntimeError(f"Found unexpected class ids: {dict(sorted(bad_classes.items()))}")
+    return counts
 
-# Check for duplicates across splits
-print("\n=== Cross-Split Duplicate Check ===")
-train_set = set(os.listdir(SPLIT / "train" / "images"))
-valid_set = set(os.listdir(SPLIT / "valid" / "images"))
-test_set = set(os.listdir(SPLIT / "test" / "images"))
-overlap_tv = train_set & valid_set
-overlap_tt = train_set & test_set
-overlap_vt = valid_set & test_set
-if overlap_tv or overlap_tt or overlap_vt:
-    print(f"  DUPLICATES FOUND: tv={overlap_tv}, tt={overlap_tt}, vt={overlap_vt}")
-    all_ok = False
-else:
-    print("  No duplicates across splits ✓")
 
-total_split = len(train_set) + len(valid_set) + len(test_set)
-print(f"\nTotal in split: {total_split} (expected 343)")
-if total_split != 343:
-    print("  WARNING: count mismatch!")
-    all_ok = False
+def validate_split(split_files):
+    all_images = []
+    for split_name, expected_files in split_files.items():
+        img_dir = SPLIT / split_name / "images"
+        lbl_dir = SPLIT / split_name / "labels"
+        imgs = sorted(f.name for f in img_dir.iterdir() if f.is_file())
+        lbls = sorted(f.stem for f in lbl_dir.iterdir() if f.is_file())
+        img_stems = sorted(Path(f).stem for f in imgs)
 
-# Write data_split.yaml
-yaml_content = f"""# Cube dataset split - 80/10/10 with seed=42
+        if img_stems != lbls:
+            raise RuntimeError(f"{split_name} image/label mismatch")
+        if sorted(expected_files) != imgs:
+            raise RuntimeError(f"{split_name} copied file list mismatch")
+        all_images.extend(imgs)
+
+        split_counts = Counter()
+        for label_file in lbl_dir.glob("*.txt"):
+            split_counts.update(read_class_ids(label_file))
+        print(
+            f"{split_name}: {len(imgs)} images, {len(lbls)} labels, "
+            f"classes={dict(sorted(split_counts.items()))}"
+        )
+
+    if len(all_images) != len(set(all_images)):
+        raise RuntimeError("Duplicate image names found across splits")
+
+
+def write_yaml():
+    yaml_content = f"""# Cube dataset split - 80/10/10 with seed={SEED}
 # Generated by split_data.py
 
-path: {SPLIT.as_posix()}
+path: split
 train: train/images
 val: valid/images
 test: test/images
 
 nc: 4
-names: ['Cube_food', 'Cube_ins', 'Cube_medicine', 'Cube_tool']
+names: {CLASS_NAMES}
 """
-yaml_path = CUBE / "data_split.yaml"
-with open(yaml_path, "w") as f:
-    f.write(yaml_content)
-print(f"\nWrote {yaml_path}")
+    yaml_path = CUBE / "data_split.yaml"
+    yaml_path.write_text(yaml_content, encoding="utf-8")
+    return yaml_path
 
-if all_ok:
-    print("\n✓ All checks passed!")
-else:
-    print("\n✗ Some checks failed - review above warnings.")
+
+def main():
+    files = image_files()
+    if not files:
+        raise RuntimeError(f"No images found in {SRC_IMAGES}")
+
+    validate_pairs(files)
+    class_counts = validate_classes(files)
+
+    rng = random.Random(SEED)
+    shuffled = list(files)
+    rng.shuffle(shuffled)
+
+    n_total = len(shuffled)
+    n_train = int(n_total * TRAIN_RATIO)
+    n_valid = int(n_total * VALID_RATIO)
+    split_files = {
+        "train": shuffled[:n_train],
+        "valid": shuffled[n_train : n_train + n_valid],
+        "test": shuffled[n_train + n_valid :],
+    }
+
+    print(f"Total images: {n_total}")
+    print(f"Class counts: {dict(sorted(class_counts.items()))}")
+    print(
+        "Split counts: "
+        f"train={len(split_files['train'])}, "
+        f"valid={len(split_files['valid'])}, "
+        f"test={len(split_files['test'])}"
+    )
+
+    if SPLIT.exists():
+        shutil.rmtree(SPLIT)
+    for split_name in split_files:
+        (SPLIT / split_name / "images").mkdir(parents=True, exist_ok=True)
+        (SPLIT / split_name / "labels").mkdir(parents=True, exist_ok=True)
+
+    for split_name, names in split_files.items():
+        for image_name in names:
+            copy_pair(image_name, split_name)
+
+    validate_split(split_files)
+    yaml_path = write_yaml()
+
+    print(f"Wrote {yaml_path}")
+    print("All checks passed.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,7 @@
-train: ../train/images
-val: ../valid/images
-test: ../test/images
+path: .
+train: split/train/images
+val: split/valid/images
+test: split/test/images
 
 nc: 4
 names: ['Cube_food', 'Cube_ins', 'Cube_medicine', 'Cube_tool']

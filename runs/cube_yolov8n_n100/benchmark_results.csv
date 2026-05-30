@@ -1,4 +1,3 @@
-Model,mAP50,mAP50_95,Precision,Recall,Avg_Latency_ms,P95_Latency_ms,Inference_ms,FPS,Model_Size_MB
-Baseline_PyTorch_GPU,0.994,0.886,0.984,0.986,,,12.3,,6.0
-OpenVINO_FP32_CPU,0.995,0.887,0.977,0.986,6.74,8.20,8.4,148.3,11.79
-OpenVINO_INT8_CPU,0.993,0.788,0.960,0.985,5.03,5.94,5.4,198.9,3.46
+Model,mAP50,Avg_Latency_ms,P95_Latency_ms,FPS,Model_Size_MB
+OpenVINO FP32,0.9392,8.05,9.97,124.16,11.79
+OpenVINO INT8,0.9386,6.31,8.20,158.47,3.46

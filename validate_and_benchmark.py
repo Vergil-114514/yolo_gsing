@@ -14,13 +14,8 @@ import json
 from collections import defaultdict
 
 import openvino as ov
-import openvino.runtime.op as real_op
 
-# Monkey-patch for NNCF compatibility (needed if we re-import)
-import sys as _sys
-_sys.modules['openvino.op'] = real_op
-
-BASE = Path(r"e:/xwechat_files/wxid_el79rox3ahjk12_09c9/msg/file/2026-05/yolo_gsing")
+BASE = Path(__file__).resolve().parent
 RUNS = BASE / "runs" / "cube_yolov8n_n100"
 SPLIT = BASE / "Cube.yolov8" / "split"
 TEST_IMAGES = SPLIT / "test" / "images"
@@ -109,7 +104,7 @@ def nms(boxes, scores, iou_thres=0.7):
         w = np.maximum(0.0, xx2 - xx1)
         h = np.maximum(0.0, yy2 - yy1)
         inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-16)
         inds = np.where(iou <= iou_thres)[0]
         order = order[inds + 1]
     return keep
@@ -128,7 +123,7 @@ def predict(compiled_model, img_tensor):
     infer_request.set_input_tensor(input_tensor)
     infer_request.infer()
     output = infer_request.get_output_tensor().data
-    return output  # (1, 8, 8400) - [cx, cy, w, h, obj, cls0, cls1, cls2, cls3]
+    return output  # (1, 8, 8400) — channels: [cx, cy, w, h, cls0, cls1, cls2, cls3]
 
 def postprocess(output, preprocess_info, orig_shape, conf_thres=0.25, iou_thres=0.7):
     """Post-process YOLOv8 output to get detections."""
@@ -137,10 +132,10 @@ def postprocess(output, preprocess_info, orig_shape, conf_thres=0.25, iou_thres=
 
     # Split outputs
     boxes_raw = output[:, :4]  # cx, cy, w, h
-    scores = output[:, 4:]  # obj, cls0, cls1, cls2, cls3
+    scores = output[:, 4:]     # cls0..cls3 (no separate objectness in YOLOv8)
 
     # Get class scores
-    class_scores = scores[:, 1:]  # cls0..cls3
+    class_scores = scores  # cls0..cls3
     max_class_scores = class_scores.max(axis=1)
     max_class_ids = class_scores.argmax(axis=1)
 
@@ -175,20 +170,40 @@ def postprocess(output, preprocess_info, orig_shape, conf_thres=0.25, iou_thres=
     if len(final_boxes) == 0:
         return np.zeros((0, 6))
 
-    return np.column_stack([final_boxes, final_cls, final_scores])
+    return np.column_stack([final_boxes, final_scores, final_cls])
 
 def load_labels(label_path):
-    """Load YOLO format labels."""
+    """Load YOLO format labels (bbox or polygon).
+
+    Bbox format:   cls cx cy w h           (5 tokens)
+    Polygon format: cls x1 y1 x2 y2 ...    (1 + 2*N tokens)
+    Both are converted to cxcywh bounding boxes (normalized).
+    """
     labels = []
-    if os.path.exists(label_path):
-        with open(label_path) as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) == 5:
-                    cls_id = int(parts[0])
-                    cx, cy, w, h = map(float, parts[1:])
-                    labels.append([cls_id, cx, cy, w, h])
-    return np.array(labels) if labels else np.zeros((0, 5))
+    if not os.path.exists(label_path):
+        return np.zeros((0, 5))
+    with open(label_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            cls_id = int(float(parts[0]))
+            coords = [float(v) for v in parts[1:]]
+            if len(coords) == 4:
+                # Bbox: cx, cy, w, h
+                cx, cy, w, h = coords
+            else:
+                # Polygon: extract min/max bounding box
+                xs = coords[0::2]
+                ys = coords[1::2]
+                xmin, xmax = min(xs), max(xs)
+                ymin, ymax = min(ys), max(ys)
+                cx = (xmin + xmax) / 2
+                cy = (ymin + ymax) / 2
+                w = xmax - xmin
+                h = ymax - ymin
+            labels.append([cls_id, cx, cy, w, h])
+    return np.array(labels)
 
 def compute_iou(box1, box2):
     """Compute IoU between two boxes in xyxy format."""
@@ -239,15 +254,13 @@ def evaluate(model, model_name, device="CPU"):
         img_path = TEST_IMAGES / img_file
         label_path = TEST_LABELS / (os.path.splitext(img_file)[0] + ".txt")
 
-        # Preprocess
+        # Preprocess（preprocess_info 已包含原始图像尺寸 h0,w0）
         img_tensor, preprocess_info = preprocess_image(img_path)
         if img_tensor is None:
             continue
 
-        h0, w0 = img_tensor.shape[2:]
-        # Actually read original image for shape
-        orig_img = cv2.imread(str(img_path))
-        orig_shape = orig_img.shape
+        h0, w0, *_ = preprocess_info
+        orig_shape = (h0, w0, 3)
 
         # Inference with timing
         t0 = time.perf_counter()
@@ -258,9 +271,9 @@ def evaluate(model, model_name, device="CPU"):
         # Post-process
         detections = postprocess(output, preprocess_info, orig_shape, conf_thres=CONF_THRES, iou_thres=IOU_THRES)
 
-        # Store detections
+        # Store detections: format is [x1,y1,x2,y2, conf, cls]
         for det in detections:
-            all_detections.append((img_idx, det[:4], det[5], int(det[4])))
+            all_detections.append((img_idx, det[:4], det[4], int(det[5])))
 
         # Load and store ground truths
         labels = load_labels(label_path)
@@ -370,7 +383,8 @@ def evaluate(model, model_name, device="CPU"):
     print(f"  FPS:             {fps:.2f}")
 
     # --- Model size ---
-    model_size = sum(f.stat().st_size for f in Path(model).parent.glob("*") if f.is_file())
+    model_size = sum(f.stat().st_size for f in Path(model).parent.glob("*.bin"))
+    model_size += sum(f.stat().st_size for f in Path(model).parent.glob("*.xml"))
     print(f"  Model size:      {model_size / 1024 / 1024:.2f} MB")
 
     results = {
@@ -418,7 +432,7 @@ if __name__ == "__main__":
     print("ACCEPTANCE CRITERIA")
     print(f"{'='*60}")
 
-    mAP_pass = abs(mAP50_delta_pct) <= 5.0
+    mAP_pass = mAP50_delta_pct >= -5.0
     fps_pass = fps_delta_pct >= 50.0
 
     print(f"  mAP50 relative loss <= 5%:  {'PASS' if mAP_pass else 'FAIL'} ({abs(mAP50_delta_pct):.2f}%)")

@@ -1,7 +1,7 @@
 task: detect
 mode: train
 model: yolov8n.pt
-data: Cube.yolov8/data_split.yaml
+data: E:\xwechat_files\wxid_el79rox3ahjk12_09c9\msg\file\2026-05\yolo_gsing\Cube.yolov8\data_split.yaml
 epochs: 100
 time: null
 patience: 100

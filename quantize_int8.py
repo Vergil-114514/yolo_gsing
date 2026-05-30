@@ -21,7 +21,7 @@ ov.Node = ov.runtime.Node
 
 import nncf
 
-BASE = Path(r"e:/xwechat_files/wxid_el79rox3ahjk12_09c9/msg/file/2026-05/yolo_gsing")
+BASE = Path(__file__).resolve().parent
 RUNS = BASE / "runs" / "cube_yolov8n_n100"
 FP32_MODEL = RUNS / "openvino_fp32" / "best.xml"
 INT8_OUTPUT = RUNS / "openvino_int8"
