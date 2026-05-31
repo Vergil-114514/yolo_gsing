@@ -2,23 +2,40 @@
 N100 部署推理脚本 — OpenVINO INT8
 ===============================
 用法:
-  python inference_n100.py                          # 默认用摄像头
+  python inference_n100.py --stream 8080             # UVC 摄像头 + Web 图传
+  python inference_n100.py --display                 # UVC 摄像头 + 本地弹窗
   python inference_n100.py --source ./test.jpg       # 单张图片
   python inference_n100.py --source ./images/        # 图片文件夹
   python inference_n100.py --source ./video.mp4      # 视频文件
 
 依赖 (Ubuntu 22.04):
   pip install openvino opencv-python numpy
+  Orbbec 深度相机额外: pip install pyorbbecsdk
 """
 
 import argparse
 import os
+import sys
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import cv2
 import numpy as np
 import openvino as ov
+
+# Orbbec 深度相机 SDK（可选，Gemini Pro 等 OpenNI 协议相机需要）
+try:
+    from pyorbbecsdk import Context as OrbbecContext, SensorType as OrbbecSensorType
+    _HAS_OBB = True
+except ImportError:
+    _HAS_OBB = False
+
+# 视频流共享缓冲区（线程安全）
+_stream_frame = None     # JPEG 编码后的字节
+_stream_lock = threading.Lock()
+_stream_fps = 0.0
 
 
 # ============================================================
@@ -37,6 +54,64 @@ CFG = {"conf": 0.25, "iou": 0.45, "display": False}
 # 默认模型路径（假设脚本和模型在同一目录结构下）
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_XML = SCRIPT_DIR / "runs" / "cube_yolov8n_n100" / "openvino_int8" / "best_int8.xml"
+
+
+# ============================================================
+# 深度相机（Orbbec Gemini Pro 等非 UVC 相机）
+# ============================================================
+class OrbbecCamera:
+    """
+    Orbbec Gemini Pro 等 OpenNI 协议相机颜色流读取。
+    替代 cv2.VideoCapture，通过 Orbbec SDK 取帧。
+    用法：
+        cam = OrbbecCamera()
+        while True:
+            frame = cam.read()
+            if frame is None: break
+        cam.close()
+    """
+
+    def __init__(self, device_index=0, width=640, height=480, fps=30):
+        if not _HAS_OBB:
+            raise ImportError("pyorbbecsdk 未安装。安装: pip install pyorbbecsdk")
+        self._ctx = OrbbecContext()
+        devices = self._ctx.query_devices()
+        if devices.get_count() == 0:
+            raise RuntimeError("未检测到 Orbbec 相机")
+        self._device = devices.get_device_by_index(device_index)
+        sensor_list = self._device.get_sensor_list()
+        self._color_sensor = sensor_list.get_sensor(OrbbecSensorType.COLOR)
+        profiles = self._color_sensor.get_stream_profile_list()
+        # 找匹配分辨率的 profile
+        target = profiles.get_video_stream_profile(width, height, fps)
+        if target is None:
+            # 退而求其次，用默认
+            target = profiles.get_default_video_stream_profile()
+            print(f"[Orbbec] 未找到 {width}x{height}@{fps} 颜色流，使用默认: {target}")
+        self._profile = target
+        self._color_sensor.start(target)
+        self._width = target.get_width()
+        self._height = target.get_height()
+        print(f"[Orbbec] 颜色流已开启: {self._width}x{self._height}")
+
+    def read(self):
+        """读取一帧，返回 BGR numpy 数组 (H, W, 3)，失败返回 None。"""
+        try:
+            frames = self._color_sensor.wait_for_frames(1000)
+            color_frame = frames.get_color_frame()
+            if color_frame is None:
+                return None
+            data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+            data = data.reshape((self._height, self._width, 3))
+            return data  # Orbbec SDK 返回 RGB，后面 preprocess 会转，这里不管
+        except Exception:
+            return None
+
+    def close(self):
+        self._color_sensor.stop()
+
+    def is_opened(self):
+        return True
 
 
 # ============================================================
@@ -171,6 +246,64 @@ def draw_detections(img, detections, fps):
 
 
 # ============================================================
+# MJPEG 视频流服务（浏览器远程查看）
+# ============================================================
+_STREAM_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>N100 Detection</title>
+<style>body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;min-height:100vh}
+img{max-width:100vw;max-height:100vh}</style></head>
+<body><img src="/stream"></body></html>"""
+
+
+class _StreamHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self._send_html()
+        elif self.path == "/stream":
+            self._send_mjpeg()
+        else:
+            self.send_error(404)
+
+    def _send_html(self):
+        body = _STREAM_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_mjpeg(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+        while True:
+            with _stream_lock:
+                buf = _stream_frame
+            if buf is None:
+                time.sleep(0.03)
+                continue
+            try:
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(buf)}\r\n\r\n".encode())
+                self.wfile.write(buf)
+                self.wfile.write(b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                break
+            time.sleep(0.03)
+
+    def log_message(self, *args):
+        pass  # 静默 HTTP 日志
+
+
+def _start_stream_server(port):
+    server = HTTPServer(("0.0.0.0", port), _StreamHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
+# ============================================================
 # 模型加载
 # ============================================================
 def load_model(xml_path):
@@ -283,23 +416,46 @@ def process_folder(compiled_model, folder, output_dir=None):
           f"平均 FPS={1000/avg_ms:.1f}, 共检测 {total_detections} 个目标")
 
 
-def process_camera(compiled_model, camera_id=0):
-    """摄像头实时推理。"""
-    cap = cv2.VideoCapture(camera_id)
+def process_camera(compiled_model, camera_source=0, use_orbbec=False, stream_port=0):
+    """摄像头实时推理。支持普通 UVC 相机、Orbbec 深度相机、Web 图传。"""
+    if use_orbbec:
+        if not _HAS_OBB:
+            print("[ERROR] pyorbbecsdk 未安装，无法使用 Orbbec 相机")
+            print("  安装: pip install pyorbbecsdk")
+            return
+        idx = int(camera_source) if str(camera_source).isdigit() else 0
+        cap = OrbbecCamera(device_index=idx)
+    elif isinstance(camera_source, int) or str(camera_source).isdigit():
+        cap = cv2.VideoCapture(int(camera_source))
+    else:
+        cap = cv2.VideoCapture(camera_source, cv2.CAP_V4L2)
+
     if not cap.isOpened():
-        print(f"[ERROR] 无法打开摄像头 id={camera_id}")
+        print(f"[ERROR] 无法打开摄像头: {camera_source}")
+        print("  Orbbec 深度相机请加 --orbbec 参数")
         return
 
-    if CFG["display"]:
-        print("[实时] 按 'q' 退出")
-    else:
-        print("[实时] 无头模式，按 Ctrl+C 退出")
+    # 启动流服务
+    stream_server = None
+    if stream_port:
+        stream_server = _start_stream_server(stream_port)
+        local_ip = _get_local_ip()
+        print(f"[图传] http://{local_ip}:{stream_port}")
+
+    label = "按 'q' 退出" if CFG["display"] else "按 Ctrl+C 退出"
+    print(f"[实时] {label}")
     fps_history = []
 
+    global _stream_frame, _stream_fps
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if use_orbbec:
+            frame = cap.read()
+            if frame is None:
+                break
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
         t0 = time.perf_counter()
         tensor, pad_info = preprocess(frame)
@@ -313,16 +469,43 @@ def process_camera(compiled_model, camera_id=0):
             fps_history.pop(0)
         avg_fps = np.mean(fps_history)
 
+        frame_drawn = draw_detections(frame, detections, avg_fps)
+
+        # 图传：编码并写入共享缓冲区
+        if stream_port:
+            _, buf = cv2.imencode(".jpg", frame_drawn, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            with _stream_lock:
+                _stream_frame = buf.tobytes()
+                _stream_fps = avg_fps
+
         if CFG["display"]:
-            frame_drawn = draw_detections(frame, detections, avg_fps)
             cv2.imshow("N100 Inference", frame_drawn)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-    cap.release()
+    if use_orbbec:
+        cap.close()
+    else:
+        cap.release()
     if CFG["display"]:
         cv2.destroyAllWindows()
+    if stream_server:
+        stream_server.shutdown()
     print(f"[退出] 平均 FPS={np.mean(fps_history):.1f}")
+
+
+def _get_local_ip():
+    """获取本机局域网 IP。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
 
 
 def process_video(compiled_model, video_path, output_path=None):
@@ -390,6 +573,10 @@ def main():
                         help="OpenVINO INT8 模型 .xml 路径")
     parser.add_argument("--camera-id", type=int, default=0,
                         help="摄像头编号 (默认 0)")
+    parser.add_argument("--camera-path", type=str, default=None,
+                        help="摄像头设备路径 (如 /dev/video2)")
+    parser.add_argument("--orbbec", action="store_true",
+                        help="使用 Orbbec 深度相机 (Gemini Pro 等非 UVC 相机)")
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="输出目录 (图片/文件夹) 或输出视频路径 (视频)")
     parser.add_argument("--conf", type=float, default=CFG["conf"],
@@ -398,6 +585,8 @@ def main():
                         help=f"NMS IOU 阈值 (默认 {CFG['iou']})")
     parser.add_argument("--display", action="store_true",
                         help="显示画面窗口 (默认关闭，适合无头/SSH 环境)")
+    parser.add_argument("--stream", type=int, default=0, metavar="PORT",
+                        help="启动 Web 图传 (指定端口，如 --stream 8080)")
     args = parser.parse_args()
 
     CFG["conf"] = args.conf
@@ -408,7 +597,8 @@ def main():
 
     source = args.source
     if source == "camera":
-        process_camera(compiled, args.camera_id)
+        cam_src = args.camera_path if args.camera_path else args.camera_id
+        process_camera(compiled, cam_src, use_orbbec=args.orbbec, stream_port=args.stream)
     elif os.path.isfile(source):
         ext = os.path.splitext(source)[1].lower()
         if ext in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
