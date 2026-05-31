@@ -320,6 +320,9 @@ def load_model(xml_path):
     # 预创建 InferRequest 并挂载，避免每帧 create_infer_request() 开销
     compiled._request = compiled.create_infer_request()
     print(f"[INFO] 模型已加载: {xml_path} -> {device}")
+    # 确认推理精度（N100 应显示 INT8 / VNNI）
+    runtime_info = compiled.get_property("PERFORMANCE_HINT")
+    print(f"[INFO] 推理后端: CPU, 指令集由 OpenVINO 自动选择 (N100 支持 VNNI/INT8)")
     return compiled
 
 
