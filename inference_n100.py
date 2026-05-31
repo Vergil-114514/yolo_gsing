@@ -49,7 +49,7 @@ COLORS = [
     (255, 255, 0),   # Cube_tool: 青色
 ]
 IMGSZ = 640
-CFG = {"conf": 0.25, "iou": 0.45, "display": False}
+CFG = {"conf": 0.8, "iou": 0.20, "display": False}
 
 # 默认模型路径（假设脚本和模型在同一目录结构下）
 SCRIPT_DIR = Path(__file__).resolve().parent
