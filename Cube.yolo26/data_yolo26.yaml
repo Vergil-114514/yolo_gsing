@@ -1,0 +1,7 @@
+path: Cube.yolo26
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 4
+names: ['Cube_food', 'Cube_ins', 'Cube_medicine', 'Cube_tool']
